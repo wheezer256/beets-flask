@@ -397,13 +397,18 @@ class SessionAPIBlueprint(ModelAPIBlueprint[SessionStateInDb]):
 
         log.debug(f"Checking status for {len(folder_hashes)} folders")
 
+        # Read the rq queues once per request, not once per folder.
+        queue_index = _index_queue_jobs()
+
         for hash, path in zip(folder_hashes, folder_paths):
             log.debug(f"Checking folder status via session from db: {path} ({hash})")
             db_status, db_date, db_exc = _get_folder_status_from_db(hash)
             log.debug(f"Found {db_status=} {db_date=} {db_exc=}")
 
             log.debug(f"Checking folder status via job queues: {path} ({hash})")
-            job_status, job_date, job_exc = _get_folder_status_from_queues(hash)
+            job_status, job_date, job_exc = _get_folder_status_from_queues(
+                hash, queue_index
+            )
             log.debug(f"Found {job_status=} {job_date=} {job_exc=}")
 
             # just for None casting, timezones prevent comparing
@@ -476,9 +481,15 @@ def _get_folder_status_from_db(
             return status, s_state_indb.updated_at, exc
 
 
-def _get_folder_status_from_queues(
-    hash: str,
-) -> tuple[FolderStatus, datetime | None, SerializedException | None]:
+QueueIndex = dict[str, dict[str, tuple[dict[str, str], Job, datetime]]]
+
+
+def _index_queue_jobs() -> QueueIndex:
+    """Fetch every job in every queue/registry once and index it by folder hash.
+
+    Per kind, a hash maps to the FIRST matching job in registry order, which is
+    exactly what _is_hash_in_jobs() returned when it scanned the list per folder.
+    """
     from beets_flask.redis import queues, redis_conn
 
     # could not simply import queues from beets_flask.redis ?
@@ -508,15 +519,34 @@ def _get_folder_status_from_queues(
             _get_jobs(q.finished_job_registry, connection=redis_conn)
         )
 
+    index: QueueIndex = {}
+    for kind, jobs in q_kinds.items():
+        by_hash: dict[str, tuple[dict[str, str], Job, datetime]] = {}
+        for j in jobs:
+            h = j.get_meta(False).get("folder_hash")
+            if h is None or h in by_hash:
+                continue
+            found = _is_hash_in_jobs(h, [j])
+            if found is not None:
+                by_hash[h] = found
+        index[kind] = by_hash
+    return index
+
+
+def _get_folder_status_from_queues(
+    hash: str,
+    queue_index: QueueIndex | None = None,
+) -> tuple[FolderStatus, datetime | None, SerializedException | None]:
+    if queue_index is None:
+        queue_index = _index_queue_jobs()
+
     # We always want the latest info, no matter from which queue.
     job_date = None
     status = FolderStatus.UNKNOWN
     exc = None
 
-    for kind in q_kinds.keys():
-        jobs = q_kinds[kind]
-
-        meta_job_date = _is_hash_in_jobs(hash, jobs)
+    for kind in queue_index.keys():
+        meta_job_date = queue_index[kind].get(hash)
         if meta_job_date is None:
             # Hash not found
             continue

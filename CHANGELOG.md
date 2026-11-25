@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `GET /session/status` no longer scales with folders × queued jobs. The rq queues and registries were re-read from redis for every folder, so with a few thousand inbox folders and a job backlog a single call took minutes and blocked its server worker. They are now read once per request.
+
 ## [2.0.0] - 26-11-15
 
 ### ⚠️ Breaking Changes ⚠️
